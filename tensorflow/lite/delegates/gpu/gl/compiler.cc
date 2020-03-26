@@ -17,12 +17,14 @@ limitations under the License.
 
 #include <algorithm>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "absl/memory/memory.h"
 #include "absl/types/any.h"
 #include "tensorflow/lite/delegates/gpu/common/data_type.h"
+#include "tensorflow/lite/delegates/gpu/common/gpu_info.h"
 #include "tensorflow/lite/delegates/gpu/common/model_transformer.h"
 #include "tensorflow/lite/delegates/gpu/common/operations.h"
 #include "tensorflow/lite/delegates/gpu/common/status.h"
@@ -100,8 +102,9 @@ class CompilerImpl : public Compiler {
     }
   }
 
-  Status Compile(const GraphFloat32& graph,
-                 const ShaderCodeCallback& callback) final {
+  absl::Status Compile(const GraphFloat32& graph,
+                       const std::unordered_set<int>& tflite_graph_io,
+                       const ShaderCodeCallback& callback) final {
     // It is important to have ids in a compiled graph identical to the given
     // graph.
     RETURN_IF_ERROR(graph.MakeExactCopy(&compiled_graph_));
@@ -126,22 +129,22 @@ class CompilerImpl : public Compiler {
     if (options_.fuse_operations) {
       FuseAutoOutputWithInline fuse_inline;
       if (!transformer.Apply("fuse_auto_with_inline", &fuse_inline)) {
-        return InternalError("fuse_auto_with_inline failed");
+        return absl::InternalError("fuse_auto_with_inline failed");
       }
       FuseInplaceUpdate fuse_inplace;
       if (!transformer.Apply("fuse_inplace_update", &fuse_inplace)) {
-        return InternalError("fuse_inplace failed");
+        return absl::InternalError("fuse_inplace failed");
       }
       if (options_.auto_input_fusion) {
         FuseAutoInput fuse_auto_input;
         if (!transformer.Apply("fuse_auto_input", &fuse_auto_input)) {
-          return InternalError("fuse_auto_input failed");
+          return absl::InternalError("fuse_auto_input failed");
         }
       }
     }
     RemoveUnusedInplaceUpdates remove_inplace_updates;
     if (!transformer.Apply("remove_inplace_updates", &remove_inplace_updates)) {
-      return InternalError("remove_inplace_updates failed");
+      return absl::InternalError("remove_inplace_updates failed");
     }
 
     // Prepare internal objects.
@@ -151,14 +154,13 @@ class CompilerImpl : public Compiler {
       object.data_type = value->tensor.type;
       // External references may not be upgraded to f16 nor be represented as
       // textures.
-      bool is_external =
-          graph.IsGraphOutput(value->id) || graph.IsGraphInput(value->id);
+      const bool is_external =
+          graph.IsGraphInput(value->id) || graph.IsGraphOutput(value->id) ||
+          tflite_graph_io.find(value->tensor.ref) != tflite_graph_io.end();
       if (is_external) {
         object.object_type = ObjectType::BUFFER;
-      } else {
-        if (options_.allow_precision_loss) {
-          MaybeConvertToFloat16(&object);
-        }
+      } else if (options_.allow_precision_loss) {
+        MaybeConvertToFloat16(&object);
       }
       objects[value->id] = std::move(object);
     }
@@ -174,7 +176,7 @@ class CompilerImpl : public Compiler {
         auto shape = outputs[0]->tensor.shape;
         for (auto output : outputs) {
           if (shape != output->tensor.shape) {
-            return FailedPreconditionError(
+            return absl::FailedPreconditionError(
                 "Workload uint3() requires all output sizes to match");
           }
         }
@@ -272,7 +274,7 @@ class CompilerImpl : public Compiler {
       RETURN_IF_ERROR(codegen.Build(std::move(attr), &shader_code));
       RETURN_IF_ERROR(callback(std::move(shader_code)));
     }
-    return OkStatus();
+    return absl::OkStatus();
   }
 
  private:

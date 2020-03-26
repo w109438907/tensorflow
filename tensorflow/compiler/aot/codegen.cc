@@ -23,8 +23,10 @@ limitations under the License.
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_replace.h"
+#include "absl/strings/str_split.h"
 #include "absl/types/span.h"
 #include "tensorflow/compiler/aot/embedded_protocol_buffers.h"
+#include "tensorflow/compiler/tf2xla/tf2xla.pb.h"
 #include "tensorflow/compiler/tf2xla/tf2xla_util.h"
 #include "tensorflow/compiler/xla/cpu_function_runtime.h"
 #include "tensorflow/compiler/xla/service/compiler.h"
@@ -168,7 +170,9 @@ Status GenArgMethods(const tf2xla::Config& config,
                      const xla::ProgramShapeProto& ps,
                      const CompileResult& compile_result, string* methods) {
   size_t num_args = ps.parameters_size();
-  if (config.feed_size() + config.variable_size() != num_args) {
+  // feed_size() + variable_size() is the maximum number of args as an
+  // implementation may not create an argument for an unused variable.
+  if (config.feed_size() + config.variable_size() < num_args) {
     return errors::InvalidArgument(
         "mismatch between feed_size(", config.feed_size(), ")+variable_size(",
         config.variable_size(), ") and num_args(", num_args, ")");
@@ -287,8 +291,8 @@ Status GenVariableMethods(const tf2xla::Config& config,
 }
 
 // Generates code implementing {Arg,Result}Names(), where T is one of
-// tf2xla::{Feed,Fetch}. Each feed or fetch name results in a C-style string
-// literal in the array, with nullptr terminating the array.
+// tf2xla::{Feed,Fetch,Variable}. Each feed or fetch name results in a C-style
+// string literal in the array, with nullptr terminating the array.
 template <typename T>
 string GenNameToIndexCode(const T& entries, bool generate) {
   // No need for a static array if we're not supposed to generate the data.
@@ -418,12 +422,21 @@ Status GenerateHeader(const CodegenOpts& opts, const tf2xla::Config& config,
   // Generate metadata.
   const string arg_names_code =
       GenNameToIndexCode(config.feed(), opts.gen_name_to_index);
+
+  auto variable_copy = config.variable();
+  for (auto& var : variable_copy) {
+    if (var.name().empty()) {
+      var.set_name(var.node_name());
+    }
+  }
+  const string variable_names_code =
+      GenNameToIndexCode(variable_copy, opts.gen_name_to_index);
+
   const string result_names_code =
       GenNameToIndexCode(config.fetch(), opts.gen_name_to_index);
   const string include_xla_data_proto =
       opts.gen_program_shape
-          ?
-          R"(#include "tensorflow/compiler/xla/xla_data.pb.h")"
+          ? R"(#include "tensorflow/compiler/xla/xla_data.pb.h")"
           : "";
 
   const string include_hlo_profile_printer_data_proto =
@@ -465,7 +478,7 @@ namespace xla { class ExecutableRunOptions; }
 
 // (Implementation detail) Entry point to the function in the object file.
 extern "C" void {{ENTRY}}(
-    void* result, const xla::ExecutableRunOptions* run_options,
+    void* result, const ::xla::ExecutableRunOptions* run_options,
     const void** args, void** temps, tensorflow::int64* profile_counters);
 
 {{DECLS_FROM_OBJ_FILE}}
@@ -507,6 +520,9 @@ class {{CLASS}} final : public tensorflow::XlaCompiledCpuFunction {
   // Number of input arguments for the compiled computation.
   static constexpr size_t kNumArgs = {{ARG_NUM}};
 
+  // Number of variables for the compiled computation.
+  static constexpr size_t kNumVariables = {{VARIABLE_NUM}};
+
   // Byte size of each argument buffer. There are kNumArgs entries.
   static const ::tensorflow::int64 ArgSize(::tensorflow::int32 index) {
     return BufferInfos()[ArgIndexToBufferIndex()[index]].size();
@@ -522,8 +538,10 @@ class {{CLASS}} final : public tensorflow::XlaCompiledCpuFunction {
       set_static_data_num_buffers(data, kNumBuffers);
       set_static_data_arg_index_table(data, ArgIndexToBufferIndex());
       set_static_data_num_args(data, kNumArgs);
+      set_static_data_num_variables(data, kNumVariables);
       set_static_data_result_index(data, kResultIndex);
       set_static_data_arg_names(data, StaticArgNames());
+      set_static_data_variable_names(data, StaticVariableNames());
       set_static_data_result_names(data, StaticResultNames());
       set_static_data_program_shape(data, StaticProgramShape());
       set_static_data_hlo_profile_printer_data(
@@ -626,18 +644,21 @@ class {{CLASS}} final : public tensorflow::XlaCompiledCpuFunction {
   // Array of names of each positional argument, terminated by nullptr.
   static const char** StaticArgNames() {{ARG_NAMES_CODE}}
 
+  // Array of names of each positional variable, terminated by nullptr.
+  static const char** StaticVariableNames() {{VARIABLE_NAMES_CODE}}
+
   // Array of names of each positional result, terminated by nullptr.
   static const char** StaticResultNames() {{RESULT_NAMES_CODE}}
 
   // Shape of the args and results.
-  static const xla::ProgramShapeProto* StaticProgramShape() {
-    static const xla::ProgramShapeProto* kShape = {{PROGRAM_SHAPE_SHIM_EXPRESSION}};
+  static const ::xla::ProgramShapeProto* StaticProgramShape() {
+    static const ::xla::ProgramShapeProto* kShape = {{PROGRAM_SHAPE_SHIM_EXPRESSION}};
     return kShape;
   }
 
   // Metadata that can be used to pretty-print profile counters.
-  static const xla::HloProfilePrinterData* StaticHloProfilePrinterData() {
-    static const xla::HloProfilePrinterData* kHloProfilePrinterData =
+  static const ::xla::HloProfilePrinterData* StaticHloProfilePrinterData() {
+    static const ::xla::HloProfilePrinterData* kHloProfilePrinterData =
       {{HLO_PROFILE_PRINTER_DATA_SHIM_EXPRESSION}};
     return kHloProfilePrinterData;
   }
@@ -654,6 +675,7 @@ class {{CLASS}} final : public tensorflow::XlaCompiledCpuFunction {
       {"{{ARG_BYTES_TOTAL}}", absl::StrCat(arg_bytes_total)},
       {"{{ARG_NAMES_CODE}}", arg_names_code},
       {"{{ARG_NUM}}", absl::StrCat(arg_index_table.size())},
+      {"{{VARIABLE_NUM}}", absl::StrCat(config.variable_size())},
       {"{{ARG_INDEX_TABLE}}", absl::StrJoin(arg_index_table, ", ")},
       {"{{ASSIGN_PROFILE_COUNTERS_SIZE}}", assign_profile_counters_size},
       {"{{CLASS}}", opts.class_name},
@@ -673,6 +695,7 @@ class {{CLASS}} final : public tensorflow::XlaCompiledCpuFunction {
       {"{{PROGRAM_SHAPE}}", xla::ShapeUtil::HumanString(xla::ProgramShape(ps))},
       {"{{PROGRAM_SHAPE_SHIM_EXPRESSION}}",
        metadata_result.program_shape_access_shim},
+      {"{{VARIABLE_NAMES_CODE}}", variable_names_code},
       {"{{RESULT_INDEX}}", absl::StrCat(result_index)},
       {"{{RESULT_NAMES_CODE}}", result_names_code},
       {"{{TEMP_BYTES_ALIGNED}}", absl::StrCat(temp_bytes_aligned)},
@@ -715,11 +738,11 @@ Status GenerateMetadata(const CodegenOpts& opts,
 
   ProtobufToEmbed program_shape_protobuf{
       CreateUniqueIdentifier(opts, "ProgramShapeProto"),
-      "xla::ProgramShapeProto", program_shape.get()};
+      "::xla::ProgramShapeProto", program_shape.get()};
 
   ProtobufToEmbed hlo_profile_printer_data_protobuf{
       CreateUniqueIdentifier(opts, "HloProfilePrinterData"),
-      "xla::HloProfilePrinterData",
+      "::xla::HloProfilePrinterData",
       compile_result.aot->hlo_profile_printer_data()};
 
   TF_ASSIGN_OR_RETURN(
@@ -745,19 +768,25 @@ Status ParseCppClass(const string& cpp_class, string* class_name,
                      std::vector<string>* namespaces) {
   class_name->clear();
   namespaces->clear();
-  size_t begin = 0;
-  size_t end = 0;
-  while ((end = cpp_class.find("::", begin)) != string::npos) {
-    const string ns = cpp_class.substr(begin, end - begin);
-    TF_RETURN_IF_ERROR(ValidateCppIdent(
-        ns, "in namespace component of cpp_class: " + cpp_class));
-    namespaces->push_back(ns);
-    begin = end + 2;  // +2 to skip the two colons
+  if (cpp_class.empty()) {
+    return errors::InvalidArgument("empty cpp_class: " + cpp_class);
   }
-  const string name = cpp_class.substr(begin);
-  TF_RETURN_IF_ERROR(
-      ValidateCppIdent(name, "in class name of cpp_class: " + cpp_class));
-  *class_name = name;
+  std::vector<string> parts = absl::StrSplit(cpp_class, "::");
+  if (parts.front().empty()) {
+    // Allow a fully qualified name that starts with "::".
+    parts.erase(parts.begin());
+  }
+  for (int i = 0; i < parts.size(); ++i) {
+    if (i < parts.size() - 1) {
+      TF_RETURN_IF_ERROR(ValidateCppIdent(
+          parts[i], "in namespace component of cpp_class: " + cpp_class));
+      namespaces->push_back(parts[i]);
+    } else {
+      TF_RETURN_IF_ERROR(ValidateCppIdent(
+          parts[i], "in class name of cpp_class: " + cpp_class));
+      *class_name = parts[i];
+    }
+  }
   return Status::OK();
 }
 

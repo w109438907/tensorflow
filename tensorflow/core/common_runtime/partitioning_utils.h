@@ -41,7 +41,7 @@ Status PartitionFunctionGraph(
 //
 // More specifically, this function
 //  (1) rewrites the indices of the `Arg` and `Retval` nodes placed
-//      on a particular device.  When a function is parittioned each
+//      on a particular device.  When a function is partitioned each
 //      partition, `subgraph`, get a subset of the arguments and
 //      return values. The `index` attributes of these _Arg and _Retval
 //      nodes reflect the indices of these parameters in the original
@@ -57,7 +57,7 @@ Status PartitionFunctionGraph(
 //  (3) records which `Arg` and `Retval` nodes live in host memory in
 //      `*_alloc_attrs`.
 Status UpdateArgAndRetvalMetadata(
-    Graph* subgraph, std::vector<int>* arg_indices,
+    Graph* subgraph, const string& device_type, std::vector<int>* arg_indices,
     std::vector<int>* ret_indices,
     std::vector<AllocatorAttributes>* arg_alloc_attrs,
     std::vector<AllocatorAttributes>* ret_alloc_attrs);

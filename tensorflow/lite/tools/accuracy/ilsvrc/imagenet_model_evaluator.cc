@@ -15,8 +15,6 @@ limitations under the License.
 
 #include "tensorflow/lite/tools/accuracy/ilsvrc/imagenet_model_evaluator.h"
 
-#include <dirent.h>
-
 #include <fstream>
 #include <iomanip>
 #include <mutex>  // NOLINT(build/c++11)
@@ -26,14 +24,16 @@ limitations under the License.
 
 #include "absl/memory/memory.h"
 #include "tensorflow/core/platform/logging.h"
-#include "tensorflow/lite/c/c_api_internal.h"
+#include "tensorflow/lite/c/common.h"
 #include "tensorflow/lite/tools/command_line_flags.h"
+#include "tensorflow/lite/tools/evaluation/evaluation_delegate_provider.h"
 #include "tensorflow/lite/tools/evaluation/proto/evaluation_config.pb.h"
 #include "tensorflow/lite/tools/evaluation/proto/evaluation_stages.pb.h"
 #include "tensorflow/lite/tools/evaluation/stages/image_classification_stage.h"
 #include "tensorflow/lite/tools/evaluation/utils.h"
 
 namespace {
+using tflite::evaluation::ImageLabel;
 
 constexpr char kNumImagesFlag[] = "num_images";
 constexpr char kModelOutputLabelsFlag[] = "model_output_labels";
@@ -41,14 +41,9 @@ constexpr char kGroundTruthImagesPathFlag[] = "ground_truth_images_path";
 constexpr char kGroundTruthLabelsFlag[] = "ground_truth_labels";
 constexpr char kBlacklistFilePathFlag[] = "blacklist_file_path";
 constexpr char kModelFileFlag[] = "model_file";
-
-std::string StripTrailingSlashes(const std::string& path) {
-  int end = path.size();
-  while (end > 0 && path[end - 1] == '/') {
-    end--;
-  }
-  return path.substr(0, end);
-}
+constexpr char kInterpreterThreadsFlag[] = "num_interpreter_threads";
+constexpr char kDelegateFlag[] = "delegate";
+constexpr char kNumRanksFlag[] = "num_ranks";
 
 template <typename T>
 std::vector<T> GetFirstN(const std::vector<T>& v, int n) {
@@ -72,10 +67,6 @@ std::vector<std::vector<T>> Split(const std::vector<T>& v, int n) {
   }
   return vecs;
 }
-
-// File pattern for imagenet files.
-const char* const kImagenetFilePattern = "*.[jJ][pP][eE][gG]";
-
 }  // namespace
 
 namespace tensorflow {
@@ -110,7 +101,7 @@ class CompositeObserver : public ImagenetModelEvaluator::Observer {
 };
 
 /*static*/ TfLiteStatus ImagenetModelEvaluator::Create(
-    int argc, char* argv[], int num_threads,
+    int* argc, char* argv[], int num_threads,
     std::unique_ptr<ImagenetModelEvaluator>* model_evaluator) {
   Params params;
   params.number_of_images = 100;
@@ -140,8 +131,19 @@ class CompositeObserver : public ImagenetModelEvaluator::Observer {
           "integer that is "
           "equal to index number of blacklisted image."),
       tflite::Flag::CreateFlag(kModelFileFlag, &params.model_file_path,
-                               "Path to test tflite model file.")};
-  tflite::Flags::Parse(&argc, const_cast<const char**>(argv), flag_list);
+                               "Path to test tflite model file."),
+      tflite::Flag::CreateFlag(
+          kInterpreterThreadsFlag, &params.num_interpreter_threads,
+          "Number of interpreter threads to use for inference."),
+      tflite::Flag::CreateFlag(
+          kDelegateFlag, &params.delegate,
+          "Delegate to use for inference, if available. "
+          "Must be one of {'nnapi', 'gpu', 'hexagon', xnnpack'}"),
+      tflite::Flag::CreateFlag(kNumRanksFlag, &params.num_ranks,
+                               "Generates the top-1 to top-k accuracy values"
+                               "where k = num_ranks. Default: 10"),
+  };
+  tflite::Flags::Parse(argc, const_cast<const char**>(argv), flag_list);
 
   if (params.number_of_images < 0) {
     LOG(ERROR) << "Invalid: num_examples";
@@ -152,11 +154,6 @@ class CompositeObserver : public ImagenetModelEvaluator::Observer {
       absl::make_unique<ImagenetModelEvaluator>(params, num_threads);
   return kTfLiteOk;
 }
-
-struct ImageLabel {
-  std::string image;
-  std::string label;
-};
 
 TfLiteStatus EvaluateModelForShard(const uint64_t shard_id,
                                    const std::vector<ImageLabel>& image_labels,
@@ -170,6 +167,9 @@ TfLiteStatus EvaluateModelForShard(const uint64_t shard_id,
                                     ->mutable_image_classification_params();
   auto* inference_params = classification_params->mutable_inference_params();
   inference_params->set_model_file_path(params.model_file_path);
+  inference_params->set_num_threads(params.num_interpreter_threads);
+  inference_params->set_delegate(
+      tflite::evaluation::ParseStringToDelegateType(params.delegate));
   classification_params->mutable_topk_accuracy_eval_params()->set_k(num_ranks);
 
   tflite::evaluation::ImageClassificationStage eval(eval_config);
@@ -191,80 +191,21 @@ TfLiteStatus EvaluateModelForShard(const uint64_t shard_id,
   return kTfLiteOk;
 }
 
-// TODO(b/130823599): Move to tools/evaluation/utils.
-TfLiteStatus FilterBlackListedImages(const std::string& blacklist_file_path,
-                                     std::vector<ImageLabel>* image_labels) {
-  if (!blacklist_file_path.empty()) {
-    std::vector<std::string> lines;
-    if (!tflite::evaluation::ReadFileLines(blacklist_file_path, &lines)) {
-      LOG(ERROR) << "Could not read: " << blacklist_file_path;
-      return kTfLiteError;
-    }
-    std::vector<int> blacklist_ids;
-    blacklist_ids.reserve(lines.size());
-    // Populate blacklist_ids with indices of images.
-    std::transform(lines.begin(), lines.end(),
-                   std::back_inserter(blacklist_ids),
-                   [](const std::string& val) { return std::stoi(val) - 1; });
-
-    std::vector<ImageLabel> filtered_images;
-    std::sort(blacklist_ids.begin(), blacklist_ids.end());
-    const size_t size_post_filtering =
-        image_labels->size() - blacklist_ids.size();
-    filtered_images.reserve(size_post_filtering);
-    int blacklist_index = 0;
-    for (int image_index = 0; image_index < image_labels->size();
-         image_index++) {
-      if (blacklist_index < blacklist_ids.size() &&
-          blacklist_ids[blacklist_index] == image_index) {
-        blacklist_index++;
-        continue;
-      }
-      filtered_images.push_back((*image_labels)[image_index]);
-    }
-
-    if (filtered_images.size() != size_post_filtering) {
-      LOG(ERROR) << "Invalid number of filtered images";
-      return kTfLiteError;
-    }
-    *image_labels = filtered_images;
-  }
-  return kTfLiteOk;
-}
-
-// TODO(b/130823599): Move to tools/evaluation/utils.
-TfLiteStatus GetSortedFileNames(const std::string dir_path,
-                                std::vector<std::string>* result) {
-  DIR* dir;
-  struct dirent* ent;
-  if (result == nullptr) {
-    LOG(ERROR) << "result cannot be nullptr";
-    return kTfLiteError;
-  }
-  if ((dir = opendir(dir_path.c_str())) != nullptr) {
-    while ((ent = readdir(dir)) != nullptr) {
-      std::string filename(std::string(ent->d_name));
-      if (filename.size() <= 2) continue;
-      result->emplace_back(dir_path + "/" + filename);
-    }
-    closedir(dir);
-  } else {
-    LOG(ERROR) << "Could not open dir: " << dir_path;
-    return kTfLiteError;
-  }
-  std::sort(result->begin(), result->end());
-  return kTfLiteOk;
-}
-
 TfLiteStatus ImagenetModelEvaluator::EvaluateModel() const {
-  const std::string data_path =
-      StripTrailingSlashes(params_.ground_truth_images_path) + "/";
+  const std::string data_path = tflite::evaluation::StripTrailingSlashes(
+                                    params_.ground_truth_images_path) +
+                                "/";
   std::vector<std::string> image_files;
-  TF_LITE_ENSURE_STATUS(GetSortedFileNames(data_path, &image_files));
+  TF_LITE_ENSURE_STATUS(
+      tflite::evaluation::GetSortedFileNames(data_path, &image_files));
   std::vector<string> ground_truth_image_labels;
   if (!tflite::evaluation::ReadFileLines(params_.ground_truth_labels_path,
-                                         &ground_truth_image_labels))
+                                         &ground_truth_image_labels)) {
+    LOG(ERROR) << "Unable to read ground truth labels from: "
+               << params_.ground_truth_labels_path
+               << " Perhaps file doesn't exist or is unreadable.";
     return kTfLiteError;
+  }
   if (image_files.size() != ground_truth_image_labels.size()) {
     LOG(ERROR) << "Images and ground truth labels don't match";
     return kTfLiteError;
@@ -277,8 +218,8 @@ TfLiteStatus ImagenetModelEvaluator::EvaluateModel() const {
   }
 
   // Filter any blacklisted images.
-  if (FilterBlackListedImages(params_.blacklist_file_path, &image_labels) !=
-      kTfLiteOk) {
+  if (tflite::evaluation::FilterBlackListedImages(params_.blacklist_file_path,
+                                                  &image_labels) != kTfLiteOk) {
     LOG(ERROR) << "Could not filter by blacklist";
     return kTfLiteError;
   }
@@ -314,7 +255,7 @@ TfLiteStatus ImagenetModelEvaluator::EvaluateModel() const {
                  &all_okay]() {
       if (EvaluateModelForShard(shard_id, image_label, model_labels, params_,
                                 &observer, params_.num_ranks) != kTfLiteOk) {
-        all_okay = all_okay && false;
+        all_okay = false;
       }
     };
     thread_pool.push_back(std::thread(func));
@@ -325,7 +266,7 @@ TfLiteStatus ImagenetModelEvaluator::EvaluateModel() const {
     thread.join();
   }
 
-  return kTfLiteOk;
+  return all_okay ? kTfLiteOk : kTfLiteError;
 }
 
 }  // namespace metrics

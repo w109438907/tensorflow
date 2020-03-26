@@ -20,8 +20,10 @@ from __future__ import print_function
 import numpy as np
 
 from tensorflow.python.framework import dtypes
+from tensorflow.python.framework import test_util
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import math_ops
+from tensorflow.python.ops import variables as variables_module
 from tensorflow.python.ops.linalg import linalg as linalg_lib
 from tensorflow.python.ops.linalg import linear_operator_test_util
 from tensorflow.python.platform import test
@@ -154,6 +156,22 @@ class BaseLinearOperatorLowRankUpdatetest(object):
 
     return operator, matrix
 
+  def test_tape_safe(self):
+    base_operator = linalg.LinearOperatorDiag(
+        variables_module.Variable([1.], name="diag"),
+        is_positive_definite=True,
+        is_self_adjoint=True)
+
+    operator = linalg.LinearOperatorLowRankUpdate(
+        base_operator,
+        u=variables_module.Variable([[2.]], name="u"),
+        v=variables_module.Variable([[1.25]], name="v")
+        if self._use_v else None,
+        diag_update=variables_module.Variable([1.25], name="diag_update")
+        if self._use_diag_update else None,
+        is_diag_update_positive=self._is_diag_update_positive)
+    self.check_tape_safe(operator)
+
 
 class LinearOperatorLowRankUpdatetestWithDiagUseCholesky(
     BaseLinearOperatorLowRankUpdatetest,
@@ -180,8 +198,8 @@ class LinearOperatorLowRankUpdatetestWithDiagCannotUseCholesky(
   """A = L + UDU^H, D !> 0, L > 0 ==> A !> 0 and we cannot use a Cholesky."""
 
   @staticmethod
-  def tests_to_skip():
-    return ["cholesky"]
+  def skip_these_tests():
+    return ["cholesky", "eigvalsh"]
 
   _use_diag_update = True
   _is_diag_update_positive = False
@@ -195,7 +213,7 @@ class LinearOperatorLowRankUpdatetestWithDiagCannotUseCholesky(
     self._rtol[dtypes.float32] = 1e-4
     self._atol[dtypes.float64] = 1e-9
     self._rtol[dtypes.float64] = 1e-9
-    self._rtol[dtypes.complex64] = 1e-4
+    self._rtol[dtypes.complex64] = 2e-4
 
 
 class LinearOperatorLowRankUpdatetestNoDiagUseCholesky(
@@ -223,8 +241,8 @@ class LinearOperatorLowRankUpdatetestNoDiagCannotUseCholesky(
   """A = L + UV^H, L > 0 ==> A is not symmetric and we cannot use a Cholesky."""
 
   @staticmethod
-  def tests_to_skip():
-    return ["cholesky"]
+  def skip_these_tests():
+    return ["cholesky", "eigvalsh"]
 
   _use_diag_update = False
   _is_diag_update_positive = None
@@ -238,7 +256,8 @@ class LinearOperatorLowRankUpdatetestNoDiagCannotUseCholesky(
     self._rtol[dtypes.float32] = 1e-4
     self._atol[dtypes.float64] = 1e-9
     self._rtol[dtypes.float64] = 1e-9
-    self._rtol[dtypes.complex64] = 1e-4
+    self._atol[dtypes.complex64] = 1e-5
+    self._rtol[dtypes.complex64] = 2e-4
 
 
 class LinearOperatorLowRankUpdatetestWithDiagNotSquare(
@@ -251,7 +270,7 @@ class LinearOperatorLowRankUpdatetestWithDiagNotSquare(
   _use_v = True
 
 
-class LinearOpearatorLowRankUpdateBroadcastsShape(test.TestCase):
+class LinearOperatorLowRankUpdateBroadcastsShape(test.TestCase):
   """Test that the operator's shape is the broadcast of arguments."""
 
   def test_static_shape_broadcasts_up_from_operator_to_other_args(self):
@@ -263,9 +282,9 @@ class LinearOpearatorLowRankUpdateBroadcastsShape(test.TestCase):
 
     # domain_dimension is 3
     self.assertAllEqual([2, 3, 3], operator.shape)
-    with self.cached_session():
-      self.assertAllEqual([2, 3, 3], operator.to_dense().eval().shape)
+    self.assertAllEqual([2, 3, 3], self.evaluate(operator.to_dense()).shape)
 
+  @test_util.run_deprecated_v1
   def test_dynamic_shape_broadcasts_up_from_operator_to_other_args(self):
     num_rows_ph = array_ops.placeholder(dtypes.int32)
 

@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "tensorflow/lite/delegates/gpu/common/status.h"
 #include "tensorflow/lite/delegates/gpu/common/types.h"
+#include "tensorflow/lite/delegates/gpu/gl/variable.h"
 
 namespace tflite {
 namespace gpu {
@@ -32,8 +33,8 @@ namespace {
 
 class Slice : public NodeShader {
  public:
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     auto output = ctx.graph->FindOutputs(ctx.node->id)[0];
 
     auto attr =
@@ -43,7 +44,7 @@ class Slice : public NodeShader {
     const int4 heights(attr.starts.h, attr.strides.h, attr.ends.h, 0);
     const int4 widths(attr.starts.w, attr.strides.w, attr.ends.w, 0);
 
-    std::vector<UniformParameter> parameters = {
+    std::vector<Variable> parameters = {
         {"channels", channels},
         {"heights", heights},
         {"widths", widths},
@@ -99,13 +100,14 @@ class Slice : public NodeShader {
     *generated_code = {
         /*parameters=*/std::move(parameters),
         /*objects=*/{},
+        /*shared_variables=*/{},
         /*workload=*/uint3(),
         /*workgroup=*/uint3(),
         /*source_code=*/std::move(code),
         /*input=*/IOStructure::ONLY_DEFINITIONS,
         /*output=*/IOStructure::AUTO,
     };
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 

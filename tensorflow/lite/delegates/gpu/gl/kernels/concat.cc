@@ -24,6 +24,7 @@ limitations under the License.
 #include "absl/memory/memory.h"
 #include "tensorflow/lite/delegates/gpu/common/status.h"
 #include "tensorflow/lite/delegates/gpu/common/types.h"
+#include "tensorflow/lite/delegates/gpu/gl/variable.h"
 
 namespace tflite {
 namespace gpu {
@@ -66,10 +67,10 @@ class AlignedConcatByChannels : public NodeShader {
     return true;
   }
 
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     if (!IsSupported(ctx)) {
-      return InvalidArgumentError(
+      return absl::InvalidArgumentError(
           "This case is not supported by aligned concat");
     }
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
@@ -86,13 +87,14 @@ class AlignedConcatByChannels : public NodeShader {
     *generated_code = {
         /*parameters=*/{{"border", inputs[0]->tensor.shape.c / 4}},
         /*objects=*/{},
+        /*shared_variables=*/{},
         /*workload=*/uint3(),
         /*workgroup=*/uint3(),
         /*source_code=*/std::move(source),
         /*input=*/IOStructure::ONLY_DEFINITIONS,
         /*output=*/IOStructure::AUTO,
     };
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -104,7 +106,7 @@ class ConcatByAnyChannel : public NodeShader {
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
 
     // Implementation supports concatenation by channels only.
-    if (attr.axis != ::tflite::gpu::Axis::CHANNELS) {
+    if (attr.axis != Axis::CHANNELS) {
       return false;
     }
 
@@ -125,10 +127,10 @@ class ConcatByAnyChannel : public NodeShader {
     return true;
   }
 
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     if (!IsSupported(ctx)) {
-      return UnimplementedError("This case is not supported by concat");
+      return absl::UnimplementedError("This case is not supported by concat");
     }
 
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
@@ -173,13 +175,14 @@ class ConcatByAnyChannel : public NodeShader {
     *generated_code = {
         /*parameters=*/{},
         /*objects=*/{},
+        /*shared_variables=*/{},
         /*workload=*/uint3(output->tensor.shape.w, output->tensor.shape.h, 1),
         /*workgroup=*/uint3(),
         /*source_code=*/std::move(code),
         /*input=*/IOStructure::ONLY_DEFINITIONS,
         /*output=*/IOStructure::ONLY_DEFINITIONS,
     };
-    return OkStatus();
+    return absl::OkStatus();
   }
 
  private:
@@ -324,7 +327,7 @@ class FlatConcatByHeight : public NodeShader {
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
 
     // Implementation supports concatenation by height only.
-    if (attr.axis != ::tflite::gpu::Axis::HEIGHT) {
+    if (attr.axis != Axis::HEIGHT) {
       return false;
     }
 
@@ -345,11 +348,11 @@ class FlatConcatByHeight : public NodeShader {
     return true;
   }
 
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
     std::string code;
-    std::vector<UniformParameter> params;
+    std::vector<Variable> params;
     for (int i = 0, shift = 0; i < inputs.size();
          shift += inputs[i]->tensor.shape.h, i++) {
       code += "if (";
@@ -372,13 +375,14 @@ class FlatConcatByHeight : public NodeShader {
     *generated_code = {
         /*parameters=*/std::move(params),
         /*objects=*/{},
+        /*shared_variables=*/{},
         /*workload=*/uint3(),
         /*workgroup=*/uint3(),
         /*source_code=*/std::move(code),
         /*input=*/IOStructure::ONLY_DEFINITIONS,
         /*output=*/IOStructure::AUTO,
     };
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
@@ -390,7 +394,7 @@ class FlatConcatByWidth : public NodeShader {
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
 
     // Implementation supports concatenation by width only.
-    if (attr.axis != ::tflite::gpu::Axis::WIDTH) {
+    if (attr.axis != Axis::WIDTH) {
       return false;
     }
 
@@ -411,11 +415,11 @@ class FlatConcatByWidth : public NodeShader {
     return true;
   }
 
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     auto inputs = ctx.graph->FindInputs(ctx.node->id);
     std::string code;
-    std::vector<UniformParameter> params;
+    std::vector<Variable> params;
     for (int i = 0, shift = 0; i < inputs.size();
          shift += inputs[i]->tensor.shape.w, i++) {
       code += "if (";
@@ -438,27 +442,29 @@ class FlatConcatByWidth : public NodeShader {
     *generated_code = {
         /*parameters=*/std::move(params),
         /*objects=*/{},
+        /*shared_variables=*/{},
         /*workload=*/uint3(),
         /*workgroup=*/uint3(),
         /*source_code=*/std::move(code),
         /*input=*/IOStructure::ONLY_DEFINITIONS,
         /*output=*/IOStructure::AUTO,
     };
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 
 class FlatConcat : public NodeShader {
  public:
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     if (FlatConcatByHeight::IsSupported(ctx)) {
       return flat_concat_by_height_.GenerateCode(ctx, generated_code);
     }
     if (FlatConcatByWidth::IsSupported(ctx)) {
       return flat_concat_by_width_.GenerateCode(ctx, generated_code);
     }
-    return InvalidArgumentError("This case is not supported by flat concat");
+    return absl::InvalidArgumentError(
+        "This case is not supported by flat concat");
   }
 
  private:

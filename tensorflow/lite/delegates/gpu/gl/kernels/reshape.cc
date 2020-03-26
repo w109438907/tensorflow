@@ -32,22 +32,19 @@ namespace {
 
 class Reshape : public NodeShader {
  public:
-  Status GenerateCode(const GenerationContext& ctx,
-                      GeneratedCode* generated_code) const final {
+  absl::Status GenerateCode(const GenerationContext& ctx,
+                            GeneratedCode* generated_code) const final {
     auto input = ctx.graph->FindInputs(ctx.node->id)[0];
     auto output = ctx.graph->FindOutputs(ctx.node->id)[0];
     if (input->tensor.shape.DimensionsProduct() !=
         output->tensor.shape.DimensionsProduct()) {
-      return InvalidArgumentError("Dimensions product is reshape don't match");
+      return absl::InvalidArgumentError(
+          "Number of elements in input & output tensors don't match.");
     }
     auto attr =
         absl::any_cast<ReshapeAttributes>(ctx.node->operation.attributes);
-    if (input->tensor.shape.DimensionsProduct() !=
-        output->tensor.shape.DimensionsProduct()) {
-      return InvalidArgumentError("Dimensions product is reshape don't match");
-    }
     if (attr.new_shape != output->tensor.shape) {
-      return InvalidArgumentError(
+      return absl::InvalidArgumentError(
           "Dimensions for output does not match new_shape attribute");
     }
 
@@ -76,13 +73,14 @@ class Reshape : public NodeShader {
             {"output_channels", output->tensor.shape.c},
         },
         /*objects=*/{},
+        /*shared_variables=*/{},
         /*workload=*/uint3(),
         /*workgroup=*/uint3(),
         /*source_code=*/std::move(code),
         /*input=*/IOStructure::ONLY_DEFINITIONS,
         /*output=*/IOStructure::AUTO,
     };
-    return OkStatus();
+    return absl::OkStatus();
   }
 };
 

@@ -97,8 +97,8 @@ Status RaggedComponentsFromVariant(const Tensor& encoded_variant,
     }
     if (values_tensor->dtype() != value_dtype) {
       return errors::InvalidArgument(
-          "Expected values Tensor dtype: ", value_dtype,
-          ", found: ", values_tensor->dtype());
+          "Expected values Tensor dtype: ", DataTypeString(value_dtype),
+          ", found: ", DataTypeString(values_tensor->dtype()));
     }
     if (values_tensor->dims() < 1) {
       return errors::InvalidArgument(
@@ -138,7 +138,7 @@ Status NestedStackRaggedTensors(
       output_ragged->nested_splits[dims - 1].vec<SPLIT_TYPE>();
   dims_splits_vec(0) = 0;
   for (int i = 0; i < ragged_components.size(); i++) {
-    int split_val = ragged_components[i].values.NumElements();
+    int split_val = ragged_components[i].values.shape().dim_size(0);
     if (input_ragged_rank != 0 && !ragged_components[i].nested_splits.empty()) {
       split_val = ragged_components[i].nested_splits[0].NumElements() - 1;
     }
@@ -217,8 +217,8 @@ class RaggedTensorFromVariantOp : public OpKernel {
  public:
   explicit RaggedTensorFromVariantOp(OpKernelConstruction* context)
       : OpKernel(context) {
-    OP_REQUIRES_OK(context,
-                   context->GetAttr("input_ragged_rank", &input_ragged_rank_));
+    OP_REQUIRES_OK(context, context->GetAttr("input_ragged_rank",
+                                             &input_ragged_rank_attr_));
     OP_REQUIRES_OK(
         context, context->GetAttr("output_ragged_rank", &output_ragged_rank_));
   }
@@ -226,7 +226,19 @@ class RaggedTensorFromVariantOp : public OpKernel {
   void Compute(OpKernelContext* context) override {
     // Read input Tensor.
     const Tensor& encoded_variant = context->input(0);
+    auto input_ragged_rank_ = input_ragged_rank_attr_;
 
+    if (input_ragged_rank_ == -1) {  // Infer input_ragged_rank_.
+      input_ragged_rank_ = output_ragged_rank_ - encoded_variant.dims();
+      OP_REQUIRES(context, input_ragged_rank_ >= 0,
+                  errors::InvalidArgument(
+                      "Inferred input_ragged_rank (output_ragged_rank - "
+                      "encoded_variant.dims()) must be >= 0, found "
+                      "output_ragged_rank: ",
+                      output_ragged_rank_,
+                      ", encoded_variant.dims(): ", encoded_variant.dims(),
+                      ", inferred input_ragged_rank: ", input_ragged_rank_));
+    }
     OP_REQUIRES(
         context,
         output_ragged_rank_ == encoded_variant.dims() + input_ragged_rank_,
@@ -266,7 +278,7 @@ class RaggedTensorFromVariantOp : public OpKernel {
   }
 
  private:
-  int input_ragged_rank_;
+  int input_ragged_rank_attr_;
   int output_ragged_rank_;
 
   void ReturnRaggedTensor(OpKernelContext* context,
@@ -292,7 +304,7 @@ class RaggedTensorFromVariantOp : public OpKernel {
   REGISTER_KERNELS_WITH_SPLIT_TYPE(value_type, int32) \
   REGISTER_KERNELS_WITH_SPLIT_TYPE(value_type, int64)
 TF_CALL_POD_TYPES(REGISTER_KERNELS);
-TF_CALL_string(REGISTER_KERNELS);
+TF_CALL_tstring(REGISTER_KERNELS);
 TF_CALL_QUANTIZED_TYPES(REGISTER_KERNELS);
 TF_CALL_quint16(REGISTER_KERNELS);
 TF_CALL_qint16(REGISTER_KERNELS);

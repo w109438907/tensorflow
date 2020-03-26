@@ -1,6 +1,20 @@
-licenses(["notice"])  # Apache 2.0
-
 load("//tensorflow:tensorflow.bzl", "tf_cc_test", "tf_cuda_library")
+
+package(
+    licenses = ["notice"],  # Apache 2.0
+)
+
+filegroup(
+    name = "pywrap_required_hdrs",
+    srcs = [
+        "devices.h",
+        "grappler_item.h",
+        "grappler_item_builder.h",
+    ],
+    visibility = [
+        "//tensorflow/python:__pkg__",
+    ],
+)
 
 cc_library(
     name = "op_types",
@@ -26,6 +40,7 @@ cc_library(
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:protos_all_cc",
+        "@com_google_absl//absl/container:node_hash_map",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/types:span",
     ],
@@ -44,6 +59,7 @@ tf_cc_test(
         "//tensorflow/core:tensor_testutil",
         "//tensorflow/core:test",
         "//tensorflow/core:test_main",
+        "//tensorflow/core:testlib",
         "@com_google_absl//absl/strings",
     ],
 )
@@ -139,6 +155,7 @@ cc_library(
         ":utils",
         "//tensorflow/core:framework",
         "//tensorflow/core:protos_all_cc",
+        "//tensorflow/core/grappler/utils:transitive_fanin",
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/strings",
     ],

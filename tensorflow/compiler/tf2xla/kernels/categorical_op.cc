@@ -103,8 +103,14 @@ class CategoricalOp : public XlaOpKernel {
     xla::PrimitiveType xla_output_type;
     OP_REQUIRES_OK(ctx,
                    DataTypeToPrimitiveType(output_type(0), &xla_output_type));
-    xla::XlaOp argmax = xla::ArgMaxTwoPass(softmax_entries, xla_output_type,
-                                           /*axis=*/class_dimension);
+    xla::XlaOp argmax;
+    if (is_gpu_) {
+      argmax = xla::ArgMaxTwoPass(softmax_entries, xla_output_type,
+                                  /*axis=*/class_dimension);
+    } else {
+      argmax = xla::ArgMax(softmax_entries, xla_output_type,
+                           /*axis=*/class_dimension);
+    }
 
     if (num_samples == 1) {
       argmax = xla::Reshape(argmax, {batch_size, 1});
@@ -117,6 +123,8 @@ class CategoricalOp : public XlaOpKernel {
                                     xla::PrimitiveType type,
                                     XlaOpKernelContext* ctx) {
     xla::XlaBuilder* builder = ctx->builder();
+    LOG_FIRST_N(WARNING, 1) << "Warning: Using tf.random.categorical with XLA"
+                               " compilation will ignore seeds.";
     // We want a number in (0, 1) rather than [0, 1) or (0, 1]:
     // * log(-log(0)) is ∞.
     // * log(-log(1)) is -∞.

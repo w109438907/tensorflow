@@ -15,7 +15,7 @@ limitations under the License.
 #define EIGEN_USE_THREADS
 
 #include "third_party/eigen3/unsupported/Eigen/CXX11/Tensor"
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/framework/device_base.h"
 #endif
@@ -25,6 +25,8 @@ limitations under the License.
 #include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/lib/core/errors.h"
 #include "tensorflow/core/lib/core/threadpool.h"
+#include "tensorflow/core/platform/casts.h"
+#include "tensorflow/core/profiler/lib/traceme.h"
 
 namespace tensorflow {
 typedef Eigen::GpuDevice GPUDevice;
@@ -38,21 +40,6 @@ namespace {
 Status Instantiate(FunctionLibraryRuntime* lib, const NameAttrList& func,
                    FunctionLibraryRuntime::Handle* handle) {
   return lib->Instantiate(func.name(), AttrSlice(&func.attr()), handle);
-}
-
-template <typename To, typename From>  // use like this: down_cast<T*>(foo);
-inline To down_cast(From* f) {         // so we only accept pointers
-  static_assert(
-      (std::is_base_of<From, typename std::remove_pointer<To>::type>::value),
-      "target type not derived from source type");
-
-  // We skip the assert and hence the dynamic_cast if RTTI is disabled.
-#if !defined(__GNUC__) || defined(__GXX_RTTI)
-  // Uses RTTI in dbg and fastbuild. asserts are disabled in opt builds.
-  assert(f == nullptr || dynamic_cast<To>(f) != nullptr);
-#endif  // !defined(__GNUC__) || defined(__GXX_RTTI)
-
-  return static_cast<To>(f);
 }
 
 // If "t" is a scalar of a supported type, returns t != 0 in "*v".
@@ -81,7 +68,7 @@ Status ToBool(gtl::ArraySlice<Tensor> t, bool* v) {
         *v = t[0].scalar<bool>()();
         break;
       case DT_STRING:
-        *v = !t[0].scalar<string>()().empty();
+        *v = !t[0].scalar<tstring>()().empty();
         break;
       default:
         return errors::InvalidArgument(DataTypeString(t[0].dtype()),
@@ -114,13 +101,13 @@ Status SetOutputs(const OpKernel* kernel, OpKernelContext* ctx,
 
 void SetRunOptions(OpKernelContext* ctx, FunctionLibraryRuntime::Options* opts,
                    bool always_collect_stats) {
-  opts->step_id = ctx->step_id();
   opts->rendezvous = ctx->rendezvous();
   opts->cancellation_manager = ctx->cancellation_manager();
   if (always_collect_stats) {
     opts->stats_collector = ctx->stats_collector();
   }
   opts->runner = ctx->runner();
+  opts->run_all_kernels_inline = ctx->run_all_kernels_inline();
   opts->step_container = ctx->step_container();
 }
 
@@ -136,22 +123,10 @@ class IfOp : public AsyncOpKernel {
   ~IfOp() override {}
 
   void ComputeAsync(OpKernelContext* ctx, DoneCallback done) override {
-    auto lib = ctx->function_library();
-    OP_REQUIRES_ASYNC(ctx, lib != nullptr,
-                      errors::Internal("No function library"), done);
-
-    // TODO(b/37549631): Because this op has `SetIsStateful()` in its op
-    // registration, this kernel may be shared by multiple subgraphs, which have
-    // different associated `FunctionLibraryRuntime` objects and hence different
-    // `FHandle` namespaces. So we must call Instantiate() to make sure we get
-    // the correct function handles with respect to `lib`. Note the underlying
-    // `lib->Instantiate()` caches the created function handles, so calling
-    // `Instantiate()` repeatedly on the same `lib` and function is cheap.
     FHandle then_handle;
     FHandle else_handle;
-    OP_REQUIRES_OK_ASYNC(ctx, Instantiate(lib, then_func_, &then_handle), done);
-    OP_REQUIRES_OK_ASYNC(ctx, Instantiate(lib, else_func_, &else_handle), done);
-
+    OP_REQUIRES_OK_ASYNC(ctx, GetHandles(ctx, &then_handle, &else_handle),
+                         done);
     bool cond;
     OP_REQUIRES_OK(ctx, ToBool({ctx->input(0)}, &cond));
     (new State(this, ctx, cond, then_handle, else_handle, done))->Start();
@@ -160,6 +135,10 @@ class IfOp : public AsyncOpKernel {
  private:
   NameAttrList then_func_;
   NameAttrList else_func_;
+
+  mutex mu_;
+  std::unordered_map<FunctionLibraryRuntime*, std::pair<FHandle, FHandle>>
+      handles_ GUARDED_BY(mu_);
 
   class State {
    public:
@@ -183,6 +162,12 @@ class IfOp : public AsyncOpKernel {
     void Start() {
       FHandle handle = cond_ ? then_handle_ : else_handle_;
       rets_.clear();
+      profiler::TraceMe trace_me(
+          [&] {
+            return absl::StrCat("IfOp #parent_step_id=", ctx_->step_id(),
+                                ",function_step_id=", opts_.step_id, "#");
+          },
+          /*level=*/2);
       lib_->Run(
           // Evaluate one of the branch.
           opts_, handle, args_, &rets_,
@@ -210,6 +195,42 @@ class IfOp : public AsyncOpKernel {
     TensorVec args_;
     TensorVec rets_;
   };
+
+  Status GetHandles(OpKernelContext* ctx, FHandle* then_handle,
+                    FHandle* else_handle) {
+    // TODO(b/37549631): Because this op has `SetIsStateful()` in its
+    // op registration, this kernel may be shared by multiple
+    // subgraphs, which have different associated
+    // `FunctionLibraryRuntime` objects and hence different `FHandle`
+    // namespaces. We currently work around this by caching the map
+    // from `FunctionLibraryRuntime*` to `FHandle` pairs for the two
+    // functions this op uses.
+    auto lib = ctx->function_library();
+    if (lib == nullptr) return errors::Internal("No function library");
+    *then_handle = kInvalidHandle;
+    *else_handle = kInvalidHandle;
+    {
+      tf_shared_lock l(mu_);
+      const auto iter = handles_.find(lib);
+      if (TF_PREDICT_TRUE(iter != handles_.end())) {
+        *then_handle = iter->second.first;
+        *else_handle = iter->second.second;
+      }
+    }
+    if (TF_PREDICT_FALSE(*then_handle == kInvalidHandle)) {
+      mutex_lock l(mu_);
+      const auto iter = handles_.find(lib);
+      if (TF_PREDICT_TRUE(iter != handles_.end())) {
+        *then_handle = iter->second.first;
+        *else_handle = iter->second.second;
+      } else {
+        TF_RETURN_IF_ERROR(Instantiate(lib, then_func_, then_handle));
+        TF_RETURN_IF_ERROR(Instantiate(lib, else_func_, else_handle));
+        handles_[lib] = {*then_handle, *else_handle};
+      }
+    }
+    return Status::OK();
+  }
 };
 
 class CaseOp : public AsyncOpKernel {
@@ -276,6 +297,12 @@ class CaseOp : public AsyncOpKernel {
         branch = branch_handles_.size() - 1;
       }
       rets_.clear();
+      profiler::TraceMe trace_me(
+          [&] {
+            return absl::StrCat("CaseOp #parent_step_id=", ctx_->step_id(),
+                                ",function_step_id=", opts_.step_id, "#");
+          },
+          /*level=*/2);
       lib_->Run(
           // Evaluate one of the branch.
           opts_, branch_handles_[branch], args_, &rets_,
@@ -333,24 +360,20 @@ class WhileOp : public AsyncOpKernel {
     auto lib = ctx->function_library();
     OP_REQUIRES_ASYNC(ctx, lib != nullptr,
                       errors::Internal("No function library"), done);
-
-    // TODO(b/37549631): Because this op has `SetIsStateful()` in its op
-    // registration, this kernel may be shared by multiple subgraphs, which have
-    // different associated `FunctionLibraryRuntime` objects and hence different
-    // `FHandle` namespaces. So we must call Instantiate() to make sure we get
-    // the correct function handles with respect to `lib`. Note the underlying
-    // `lib->Instantiate()` caches the created function handles, so calling
-    // `Instantiate()` repeatedly on the same `lib` and function is cheap.
     FHandle cond_handle;
     FHandle body_handle;
-    OP_REQUIRES_OK_ASYNC(ctx, Instantiate(lib, cond_func_, &cond_handle), done);
-    OP_REQUIRES_OK_ASYNC(ctx, Instantiate(lib, body_func_, &body_handle), done);
+    OP_REQUIRES_OK_ASYNC(ctx, GetHandles(ctx, &cond_handle, &body_handle),
+                         done);
     (new State(this, ctx, cond_handle, body_handle, done))->Start();
   }
 
  private:
   NameAttrList cond_func_;
   NameAttrList body_func_;
+
+  mutex mu_;
+  std::unordered_map<FunctionLibraryRuntime*, std::pair<FHandle, FHandle>>
+      handles_ GUARDED_BY(mu_);
 
   class State {
    public:
@@ -384,6 +407,13 @@ class WhileOp : public AsyncOpKernel {
     TensorVec rets_;
 
     void EvalCond() {
+      profiler::TraceMe trace_me(
+          [&] {
+            return absl::StrCat(
+                "WhileOp-EvalCond #parent_step_id=", ctx_->step_id(),
+                ",function_step_id=", opts_.step_id, "#");
+          },
+          /*level=*/2);
       lib_->Run(
           // Evaluate the condition.
           opts_, cond_handle_, args_, &rets_,
@@ -405,7 +435,7 @@ class WhileOp : public AsyncOpKernel {
         return Finish(s);
       }
       Tensor cond_t;
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
       const DeviceBase::GpuDeviceInfo* gpu_device_info =
           ctx_->device()->tensorflow_gpu_device_info();
       const bool is_hostmem_dtype =
@@ -444,6 +474,13 @@ class WhileOp : public AsyncOpKernel {
         return Finish(Status::OK());
       }
       rets_.clear();
+      profiler::TraceMe trace_me(
+          [&] {
+            return absl::StrCat(
+                "WhileOp-StartBody #parent_step_id=", ctx_->step_id(),
+                ",function_step_id=", opts_.step_id, "#");
+          },
+          /*level=*/2);
       lib_->Run(
           // Evaluate the body.
           opts_, body_handle_, args_, &rets_,
@@ -473,6 +510,42 @@ class WhileOp : public AsyncOpKernel {
       delete this;
     }
   };
+
+  Status GetHandles(OpKernelContext* ctx, FHandle* cond_handle,
+                    FHandle* body_handle) {
+    // TODO(b/37549631): Because this op has `SetIsStateful()` in its
+    // op registration, this kernel may be shared by multiple
+    // subgraphs, which have different associated
+    // `FunctionLibraryRuntime` objects and hence different `FHandle`
+    // namespaces. We currently work around this by caching the map
+    // from `FunctionLibraryRuntime*` to `FHandle` pairs for the two
+    // functions this op uses.
+    auto lib = ctx->function_library();
+    if (lib == nullptr) return errors::Internal("No function library");
+    *cond_handle = kInvalidHandle;
+    *body_handle = kInvalidHandle;
+    {
+      tf_shared_lock l(mu_);
+      const auto iter = handles_.find(lib);
+      if (TF_PREDICT_TRUE(iter != handles_.end())) {
+        *cond_handle = iter->second.first;
+        *body_handle = iter->second.second;
+      }
+    }
+    if (TF_PREDICT_FALSE(*cond_handle == kInvalidHandle)) {
+      mutex_lock l(mu_);
+      const auto iter = handles_.find(lib);
+      if (TF_PREDICT_TRUE(iter != handles_.end())) {
+        *cond_handle = iter->second.first;
+        *body_handle = iter->second.second;
+      } else {
+        TF_RETURN_IF_ERROR(Instantiate(lib, cond_func_, cond_handle));
+        TF_RETURN_IF_ERROR(Instantiate(lib, body_func_, body_handle));
+        handles_[lib] = {*cond_handle, *body_handle};
+      }
+    }
+    return Status::OK();
+  }
 };
 // TODO(drpng): remove these.
 REGISTER_KERNEL_BUILDER(Name("_While").Device(DEVICE_CPU), WhileOp);
@@ -483,6 +556,20 @@ REGISTER_KERNEL_BUILDER(Name("While").Device(DEVICE_GPU), WhileOp);
 
 REGISTER_KERNEL_BUILDER(Name("StatelessWhile").Device(DEVICE_CPU), WhileOp);
 REGISTER_KERNEL_BUILDER(Name("StatelessWhile").Device(DEVICE_GPU), WhileOp);
+
+class ToBoolOp : public OpKernel {
+ public:
+  explicit ToBoolOp(OpKernelConstruction* ctx) : OpKernel(ctx) {}
+  void Compute(OpKernelContext* ctx) override {
+    bool b;
+    OP_REQUIRES_OK(ctx, ToBool({ctx->input(0)}, &b));
+    Tensor* out;
+    OP_REQUIRES_OK(ctx, ctx->allocate_output(0, TensorShape({}), &out));
+    out->scalar<bool>()() = b;
+  }
+};
+
+REGISTER_KERNEL_BUILDER(Name("ToBool").Device(DEVICE_CPU), ToBoolOp);
 
 Status GetScalar(OpKernelContext* ctx, int index, int32* value,
                  const char* label) {
@@ -594,6 +681,12 @@ class ForOp : public AsyncOpKernel {
         args_[1 + i] = std::move(rets_[i]);
       }
       rets_.clear();
+      profiler::TraceMe trace_me(
+          [&] {
+            return absl::StrCat("ForOp #parent_step_id=", ctx_->step_id(),
+                                ",function_step_id=", opts_.step_id, "#");
+          },
+          /*level=*/2);
       lib_->Run(opts_, kernel_->body_handle_, args_, &rets_,
                 [this](const Status& s) {
                   if (s.ok()) {

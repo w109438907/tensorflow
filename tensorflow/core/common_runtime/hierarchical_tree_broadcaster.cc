@@ -86,7 +86,7 @@ Status HierarchicalTreeBroadcaster::InitializeCollectiveParams(
   // Precondition: device_names must be sorted so that all devices in
   // the same task are adjacent.
   VLOG(2) << "Sorted task names: "
-          << str_util::Join(col_params->instance.task_names, ", ");
+          << absl::StrJoin(col_params->instance.task_names, ", ");
   std::vector<int> dev_per_task;
   const string* prior_task_name = &col_params->instance.task_names[0];
   int dev_count = 1;
@@ -312,7 +312,7 @@ void HierarchicalTreeBroadcaster::RunTree() {
     }
 
     mutex mu;               // also guards status_ while callbacks are pending
-    int pending_count = 0;  // GUARDED_BY(mu)
+    int pending_count = 0;  // TF_GUARDED_BY(mu)
     condition_variable all_done;
 
     if (my_rank >= 0 && my_rank != source_rank) {
@@ -409,6 +409,8 @@ void HierarchicalTreeBroadcaster::DispatchSend(int subdiv, int dst_rank,
                                                int src_rank,
                                                const Tensor* src_tensor,
                                                const StatusCallback& done) {
+  auto op_annotation = ScopedMemoryDebugAnnotation(
+      col_ctx_->op_ctx->op_kernel().name_view().data());
   string send_buf_key =
       BroadcastBufKey(col_ctx_->exec_key, subdiv, src_rank, dst_rank);
   int dst_idx =
